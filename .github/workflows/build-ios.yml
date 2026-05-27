@@ -128,7 +128,40 @@ jobs:
             puts "  ✓ podspec: excluded OldArch Swift (LegacyActionSheet/LegacyMenuView)"
           end
 
-          puts "All patches applied!"
+          puts "All @react-native-menu patches applied!"
+
+          # ── react-native-keyboard-controller@1.20.7 ────────────────────────────
+          # 19 Swift files are missing import Foundation and/or import UIKit.
+          # Xcode 16 is stricter: @objc, NSObject, Notification, NotificationCenter
+          # etc. all require explicit Foundation; UIKit types (UITextInput, CGFloat,
+          # UIResponder, UIView …) require UIKit.
+          # Without Foundation, CocoaPods' bridging header (which makes RCTViewManager,
+          # RCTBridge, RCTDirectEventBlock etc. visible from Swift) is never activated —
+          # so adding the two imports fixes BOTH the stdlib type errors AND the
+          # React-Native ObjC type errors simultaneously.
+          kbc_base = Dir.glob('node_modules/.bun/react-native-keyboard-controller*/node_modules/react-native-keyboard-controller').first
+          if kbc_base
+            puts "\nPatching: #{kbc_base}/ios"
+            patched = 0
+            Dir.glob("#{kbc_base}/ios/**/*.swift").each do |f|
+              c = File.read(f)
+              needs_f = !c.include?('import Foundation')
+              needs_u = !c.include?('import UIKit')
+              next unless needs_f || needs_u
+              header = ""
+              header += "import Foundation\n" if needs_f
+              header += "import UIKit\n"      if needs_u
+              File.write(f, header + c)
+              added = [needs_f && 'Foundation', needs_u && 'UIKit'].select { |x| x }.join(', ')
+              puts "  ✓ #{File.basename(f)}: added #{added}"
+              patched += 1
+            end
+            puts "  #{patched} files patched"
+          else
+            puts "Warning: react-native-keyboard-controller not found, skipping"
+          end
+
+          puts "\nAll source patches applied!"
           RUBY
 
       - name: Expo prebuild (iOS, skip pod install)
