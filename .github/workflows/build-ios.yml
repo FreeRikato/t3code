@@ -46,7 +46,8 @@ jobs:
           echo "Found workspace: $WORKSPACE"
           echo "=== Available schemes ==="
           xcodebuild -workspace "$WORKSPACE" -list 2>&1
-          SCHEME=$(xcodebuild -workspace "$WORKSPACE" -list 2>&1 | awk '/Schemes:/,0' | grep -v "Schemes:" | grep -v "^$" | head -1 | xargs)
+          # Pick the main app scheme — skip EASClient, Pods, and other helper targets
+          SCHEME=$(xcodebuild -workspace "$WORKSPACE" -list 2>&1 | awk '/Schemes:/,0' | grep -v "Schemes:" | grep -v "^$" | grep -v "EASClient" | grep -v "Pods" | grep -v "Tests" | head -1 | xargs)
           echo "SCHEME=$SCHEME" >> $GITHUB_ENV
           echo "Selected scheme: $SCHEME"
 
@@ -62,7 +63,9 @@ jobs:
             CODE_SIGNING_ALLOWED=NO \
             CODE_SIGNING_REQUIRED=NO \
             CODE_SIGN_IDENTITY="" \
-            PROVISIONING_PROFILE=""
+            PROVISIONING_PROFILE="" \
+            SWIFT_VERSION=5 \
+            OTHER_SWIFT_FLAGS="-suppress-warnings"
 
       - name: List DerivedData contents
         if: always()
