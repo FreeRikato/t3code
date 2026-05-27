@@ -43,11 +43,10 @@ jobs:
           echo "SCHEME=$SCHEME" >> $GITHUB_ENV
           echo "Using scheme: $SCHEME"
 
-      - name: Build iOS app (ad-hoc signing)
+      - name: Build iOS app
         working-directory: apps/mobile/ios
         run: |
-          set -eo pipefail
-          echo "Building: workspace=$WORKSPACE scheme=$SCHEME"
+          # Full output - no piping, no masking
           xcodebuild build \
             -workspace "$WORKSPACE" \
             -scheme "$SCHEME" \
@@ -57,19 +56,15 @@ jobs:
             CODE_SIGN_IDENTITY="-" \
             CODE_SIGNING_REQUIRED=NO \
             CODE_SIGNING_ALLOWED=YES \
-            AD_HOC_CODE_SIGNING_ALLOWED=YES \
-            PROVISIONING_PROFILE="" \
-            2>&1 | tee "$RUNNER_TEMP/build.log" | grep -E "error:|warning:|Build succeeded|Build FAILED|CompileSwift|CompileC|Ld " || true
-          # Show last 30 lines of full log for context
-          echo "=== Last 30 lines of build log ==="
-          tail -30 "$RUNNER_TEMP/build.log"
+            PROVISIONING_PROFILE=""
 
       - name: List DerivedData contents
         if: always()
         run: |
-          echo "=== DerivedData structure ==="
-          find "$RUNNER_TEMP/DerivedData" -name "*.app" 2>/dev/null || echo "No .app found"
-          find "$RUNNER_TEMP/DerivedData" -maxdepth 4 -type d 2>/dev/null | head -30
+          echo "=== All .app bundles found ==="
+          find "$RUNNER_TEMP/DerivedData" -name "*.app" 2>/dev/null || echo "None found"
+          echo "=== DerivedData top-level dirs ==="
+          find "$RUNNER_TEMP/DerivedData" -maxdepth 5 -type d 2>/dev/null | head -40
 
       - name: Package as IPA
         run: |
@@ -77,7 +72,6 @@ jobs:
           APP_PATH=$(find "$RUNNER_TEMP/DerivedData" -name "*.app" \
             -not -path "*/PlugIns/*" \
             -not -name "*.appex" \
-            -not -path "*/simulator/*" \
             2>/dev/null | head -1)
           echo "Found app: $APP_PATH"
           if [ -z "$APP_PATH" ]; then
@@ -96,11 +90,3 @@ jobs:
           name: T3Code-Preview-IPA
           path: ${{ runner.temp }}/T3Code-Preview.ipa
           retention-days: 7
-
-      - name: Upload build log (on failure)
-        if: failure()
-        uses: actions/upload-artifact@v4
-        with:
-          name: build-log
-          path: ${{ runner.temp }}/build.log
-          retention-days: 3
