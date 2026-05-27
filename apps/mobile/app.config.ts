@@ -135,10 +135,10 @@ const config: ExpoConfig = {
   extra: {
     appVariant: APP_VARIANT,
     eas: {
-      projectId: "d763fcb8-d37c-41ea-a773-b54a0ab4a454",
+      projectId: "4f947639-df07-42c9-826a-ef2ece66341a",
     },
   },
-  owner: "pingdotgg",
+  owner: "aravinthan",
 };
 
 export default config;

@@ -1,0 +1,82 @@
+name: Build iOS IPA
+
+on:
+  workflow_dispatch: # Manual trigger from GitHub UI
+
+jobs:
+  build-ios:
+    runs-on: macos-15
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout branch
+        uses: actions/checkout@v4
+        with:
+          ref: t3code/mobile-remote-connect
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.14
+
+      - name: Install dependencies
+        run: bun install
+
+      - name: Install Expo CLI
+        run: npm install -g @expo/cli
+
+      - name: Expo prebuild (iOS)
+        working-directory: apps/mobile
+        env:
+          APP_VARIANT: preview
+        run: npx expo prebuild --platform ios --clean
+
+      - name: Find workspace and scheme
+        working-directory: apps/mobile/ios
+        run: |
+          WORKSPACE=$(ls -d *.xcworkspace | head -1)
+          echo "WORKSPACE=$WORKSPACE" >> $GITHUB_ENV
+          echo "Found workspace: $WORKSPACE"
+          # List schemes
+          xcodebuild -workspace "$WORKSPACE" -list 2>/dev/null || true
+
+      - name: Build iOS archive (no code signing)
+        working-directory: apps/mobile/ios
+        run: |
+          xcodebuild archive \
+            -workspace "$WORKSPACE" \
+            -scheme "T3Code" \
+            -configuration Release \
+            -archivePath "$RUNNER_TEMP/T3Code.xcarchive" \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            PROVISIONING_PROFILE="" \
+            -destination "generic/platform=iOS" \
+            | xcpretty || xcodebuild archive \
+              -workspace "$WORKSPACE" \
+              -scheme "T3 Code Preview" \
+              -configuration Release \
+              -archivePath "$RUNNER_TEMP/T3Code.xcarchive" \
+              CODE_SIGNING_ALLOWED=NO \
+              CODE_SIGNING_REQUIRED=NO \
+              CODE_SIGN_IDENTITY="" \
+              PROVISIONING_PROFILE="" \
+              -destination "generic/platform=iOS"
+
+      - name: Package as IPA
+        run: |
+          APP_PATH=$(find "$RUNNER_TEMP/T3Code.xcarchive/Products/Applications" -name "*.app" | head -1)
+          echo "Found app: $APP_PATH"
+          mkdir -p "$RUNNER_TEMP/Payload"
+          cp -r "$APP_PATH" "$RUNNER_TEMP/Payload/"
+          cd "$RUNNER_TEMP"
+          zip -r T3Code-Preview.ipa Payload/
+          echo "IPA created: $(du -sh T3Code-Preview.ipa)"
+
+      - name: Upload IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: T3Code-Preview-IPA
+          path: ${{ runner.temp }}/T3Code-Preview.ipa
+          retention-days: 7
