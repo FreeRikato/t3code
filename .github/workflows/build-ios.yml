@@ -25,6 +25,112 @@ jobs:
       - name: Install Expo CLI
         run: npm install -g @expo/cli
 
+      # @react-native-menu/menu@2.0.0 has Swift source bugs that surface with Xcode 16.4
+      # and React Native new architecture. We patch the source in node_modules directly
+      # rather than changing app dependencies or updating the package.
+      #
+      # Errors fixed:
+      #   1. FabricActionSheetView.swift        — @objc without Foundation (Xcode 16 strict)
+      #   2. FabricViewImplementationProtocol   — UIEdgeInsets needs UIKit import
+      #   3. ActionSheetView.swift              — reactSetFrame removed in RN new arch;
+      #                                           RCTPresentedViewController is old-arch ObjC
+      #   4. MenuViewImplementation.swift       — reactSetFrame same
+      #   5. RCTAlertAction.swift               — RCTConvert.uiColor is old-arch ObjC
+      #   6. RCTMenuItem.swift                  — same
+      #   7. OldArch/Legacy*.swift              — RCTDirectEventBlock old-arch only;
+      #                                           exclude from podspec (new arch = Fabric only)
+      - name: Patch @react-native-menu/menu (Xcode 16.4 + New Arch compat)
+        run: |
+          ruby << 'RUBY'
+          menu_base = Dir.glob('node_modules/.bun/@react-native-menu+menu*/node_modules/@react-native-menu/menu').first
+          unless menu_base
+            puts "Warning: @react-native-menu/menu not found, skipping"
+            exit 0
+          end
+          ios = File.join(menu_base, 'ios')
+          puts "Patching: #{ios}"
+
+          # 1. FabricActionSheetView.swift — add missing import Foundation
+          f = "#{ios}/NewArch/FabricActionSheetView.swift"
+          c = File.read(f)
+          unless c.include?('import Foundation')
+            File.write(f, "import Foundation\n#{c}")
+            puts "  ✓ FabricActionSheetView: added import Foundation"
+          end
+
+          # 2. FabricViewImplementationProtocol.swift — add missing import UIKit
+          f = "#{ios}/NewArch/FabricViewImplementationProtocol.swift"
+          c = File.read(f)
+          unless c.include?('import UIKit')
+            File.write(f, c.sub('import Foundation', "import Foundation\nimport UIKit"))
+            puts "  ✓ FabricViewImplementationProtocol: added import UIKit"
+          end
+
+          # 3. ActionSheetView.swift
+          #    a. Remove reactSetFrame override (no-op; UIView+React category not bridged in new arch)
+          #    b. Replace RCTPresentedViewController() with pure UIKit window traversal
+          f = "#{ios}/Shared/ActionSheetView.swift"
+          c = File.read(f)
+          c = c.gsub(/\n +public override func reactSetFrame\(_ frame: CGRect\) \{.*?\}\n/m, "\n")
+          c = c.gsub("if let root = RCTPresentedViewController() {",
+            "let _kw = UIApplication.shared.connectedScenes\n" \
+            "            .compactMap { $0 as? UIWindowScene }.first?.windows\n" \
+            "            .first(where: { $0.isKeyWindow })?.rootViewController\n" \
+            "        if let root = _kw {")
+          File.write(f, c)
+          puts "  ✓ ActionSheetView: removed reactSetFrame, replaced RCTPresentedViewController"
+
+          # 4. MenuViewImplementation.swift — remove reactSetFrame override (same reason)
+          f = "#{ios}/Shared/MenuViewImplementation.swift"
+          c = File.read(f)
+          c = c.gsub(/\n +public override func reactSetFrame\(_ frame: CGRect\) \{.*?\}\n/m, "\n")
+          File.write(f, c)
+          puts "  ✓ MenuViewImplementation: removed reactSetFrame"
+
+          # 5 & 6. RCTAlertAction.swift + RCTMenuItem.swift
+          #         Replace RCTConvert.uiColor() with an inline ARGB helper.
+          #         React Native encodes colors as NSNumber ARGB integers (0xAARRGGBB).
+          color_helper = <<~SWIFT
+
+            // RCTConvert.uiColor replacement (avoids old-arch React-Core ObjC dependency)
+            private func _rnColor(_ v: Any) -> UIColor {
+              guard let n = v as? NSNumber else { return .clear }
+              let c = n.int64Value
+              return UIColor(red:   CGFloat((c >> 16) & 0xff) / 255,
+                             green: CGFloat((c >>  8) & 0xff) / 255,
+                             blue:  CGFloat( c        & 0xff) / 255,
+                             alpha: CGFloat((c >> 24) & 0xff) / 255)
+            }
+
+          SWIFT
+
+          ['Shared/RCTAlertAction.swift', 'Shared/RCTMenuItem.swift'].each do |rel|
+            f = "#{ios}/#{rel}"
+            c = File.read(f)
+            if c.include?('RCTConvert')
+              c = c.sub("import UIKit;\n", "import UIKit;\n#{color_helper}")
+              c = c.gsub(/RCTConvert\.uiColor\(([^)]+)\)/, '_rnColor(\1)')
+              File.write(f, c)
+              puts "  ✓ #{File.basename(f)}: replaced RCTConvert.uiColor"
+            end
+          end
+
+          # 7. Patch the podspec to exclude OldArch Swift files.
+          #    LegacyActionSheetView + LegacyMenuViewImplementation use RCTDirectEventBlock,
+          #    an old-arch-only typedef. New arch uses FabricActionSheetView/FabricMenuView.
+          #    We keep all ObjC/ObjC++ source (needed for bridging) but drop OldArch Swift.
+          ps = "#{menu_base}/react-native-menu.podspec"
+          c = File.read(ps)
+          if c.include?('"ios/**/*.{h,m,mm,swift}"')
+            c = c.sub('"ios/**/*.{h,m,mm,swift}"',
+              '"ios/**/*.{h,m,mm}", "ios/NewArch/**/*.swift", "ios/Shared/**/*.swift"')
+            File.write(ps, c)
+            puts "  ✓ podspec: excluded OldArch Swift (LegacyActionSheet/LegacyMenuView)"
+          end
+
+          puts "All patches applied!"
+          RUBY
+
       - name: Expo prebuild (iOS, skip pod install)
         working-directory: apps/mobile
         env:
