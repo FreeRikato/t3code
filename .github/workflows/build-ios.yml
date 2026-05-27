@@ -76,20 +76,16 @@ jobs:
           echo "WORKSPACE=$WORKSPACE" >> $GITHUB_ENV
           echo "Found workspace: $WORKSPACE"
 
-          echo "=== All available schemes ==="
-          xcodebuild -workspace "$WORKSPACE" -list 2>&1
-
-          # Pick main app scheme — skip EASClient, Pods, Tests, and framework helper targets
-          SCHEME=$(xcodebuild -workspace "$WORKSPACE" -list 2>&1 \
-            | awk '/Schemes:/,0' \
-            | grep -v "Schemes:" \
-            | grep -v "^$" \
-            | grep -v -i "EASClient\|Pods\|Tests\|ExpoModules\|hermes\|React" \
-            | head -1 \
-            | xargs)
-
+          # Expo prebuild always names the main app scheme identically to the workspace.
+          # e.g. T3CodePreview.xcworkspace → scheme "T3CodePreview"
+          # Deriving it this way is more reliable than grep-filtering the scheme list,
+          # which previously selected EXConstants (an Expo SDK pod scheme) first.
+          SCHEME="${WORKSPACE%.xcworkspace}"
           echo "SCHEME=$SCHEME" >> $GITHUB_ENV
           echo "Selected scheme: $SCHEME"
+
+          echo "=== All available schemes (for reference) ==="
+          xcodebuild -workspace "$WORKSPACE" -list 2>&1
 
       - name: Archive iOS app (unsigned)
         working-directory: apps/mobile/ios
@@ -107,6 +103,7 @@ jobs:
             CODE_SIGNING_ALLOWED=NO \
             PROVISIONING_PROFILE="" \
             SKIP_INSTALL=NO \
+            SWIFT_STRICT_CONCURRENCY=minimal \
             GCC_WARN_INHIBIT_ALL_WARNINGS=YES \
             OTHER_SWIFT_FLAGS="-suppress-warnings"
 
