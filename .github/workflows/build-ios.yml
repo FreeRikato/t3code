@@ -37,42 +37,47 @@ jobs:
           WORKSPACE=$(ls -d *.xcworkspace | head -1)
           echo "WORKSPACE=$WORKSPACE" >> $GITHUB_ENV
           echo "Found workspace: $WORKSPACE"
-          # List schemes
-          xcodebuild -workspace "$WORKSPACE" -list 2>/dev/null || true
+          # List all available schemes
+          echo "Available schemes:"
+          xcodebuild -workspace "$WORKSPACE" -list 2>&1 || true
+          # Pick first scheme
+          SCHEME=$(xcodebuild -workspace "$WORKSPACE" -list 2>&1 | awk '/Schemes:/,0' | grep -v "Schemes:" | grep -v "^$" | head -1 | xargs)
+          echo "SCHEME=$SCHEME" >> $GITHUB_ENV
+          echo "Using scheme: $SCHEME"
 
-      - name: Build iOS archive (no code signing)
+      - name: Build iOS app (no code signing)
         working-directory: apps/mobile/ios
         run: |
-          xcodebuild archive \
+          set -e
+          echo "Building with workspace: $WORKSPACE, scheme: $SCHEME"
+          xcodebuild build \
             -workspace "$WORKSPACE" \
-            -scheme "T3Code" \
+            -scheme "$SCHEME" \
             -configuration Release \
-            -archivePath "$RUNNER_TEMP/T3Code.xcarchive" \
+            -sdk iphoneos \
+            -derivedDataPath "$RUNNER_TEMP/DerivedData" \
             CODE_SIGNING_ALLOWED=NO \
             CODE_SIGNING_REQUIRED=NO \
             CODE_SIGN_IDENTITY="" \
             PROVISIONING_PROFILE="" \
-            -destination "generic/platform=iOS" \
-            | xcpretty || xcodebuild archive \
-              -workspace "$WORKSPACE" \
-              -scheme "T3 Code Preview" \
-              -configuration Release \
-              -archivePath "$RUNNER_TEMP/T3Code.xcarchive" \
-              CODE_SIGNING_ALLOWED=NO \
-              CODE_SIGNING_REQUIRED=NO \
-              CODE_SIGN_IDENTITY="" \
-              PROVISIONING_PROFILE="" \
-              -destination "generic/platform=iOS"
+            2>&1 | tail -50
 
-      - name: Package as IPA
+      - name: Find built .app and package as IPA
         run: |
-          APP_PATH=$(find "$RUNNER_TEMP/T3Code.xcarchive/Products/Applications" -name "*.app" | head -1)
-          echo "Found app: $APP_PATH"
+          set -e
+          echo "Searching for .app in DerivedData..."
+          find "$RUNNER_TEMP/DerivedData" -name "*.app" -not -path "*/PlugIns/*" -not -name "*.appex" 2>/dev/null
+          APP_PATH=$(find "$RUNNER_TEMP/DerivedData" -name "*.app" -not -path "*/PlugIns/*" -not -name "*.appex" | grep -i "iphoneos" | head -1)
+          if [ -z "$APP_PATH" ]; then
+            echo "Falling back to any .app..."
+            APP_PATH=$(find "$RUNNER_TEMP/DerivedData" -name "*.app" -not -path "*/PlugIns/*" -not -name "*.appex" | head -1)
+          fi
+          echo "Using app: $APP_PATH"
           mkdir -p "$RUNNER_TEMP/Payload"
           cp -r "$APP_PATH" "$RUNNER_TEMP/Payload/"
           cd "$RUNNER_TEMP"
           zip -r T3Code-Preview.ipa Payload/
-          echo "IPA created: $(du -sh T3Code-Preview.ipa)"
+          echo "IPA size: $(du -sh T3Code-Preview.ipa)"
 
       - name: Upload IPA
         uses: actions/upload-artifact@v4
