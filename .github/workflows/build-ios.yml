@@ -25,11 +25,18 @@ jobs:
       - name: Install Expo CLI
         run: npm install -g @expo/cli
 
-      - name: Expo prebuild (iOS)
+      - name: Expo prebuild (iOS, skip pod install)
         working-directory: apps/mobile
         env:
           APP_VARIANT: preview
-        run: npx expo prebuild --platform ios --clean
+        run: npx expo prebuild --platform ios --clean --no-install
+
+      - name: Install CocoaPods dependencies
+        working-directory: apps/mobile/ios
+        run: |
+          gem install cocoapods --no-document 2>/dev/null || true
+          pod install --repo-update
+          echo "=== Pod install complete ==="
 
       - name: Find workspace and scheme
         working-directory: apps/mobile/ios
@@ -41,48 +48,59 @@ jobs:
           xcodebuild -workspace "$WORKSPACE" -list 2>&1
           SCHEME=$(xcodebuild -workspace "$WORKSPACE" -list 2>&1 | awk '/Schemes:/,0' | grep -v "Schemes:" | grep -v "^$" | head -1 | xargs)
           echo "SCHEME=$SCHEME" >> $GITHUB_ENV
-          echo "Using scheme: $SCHEME"
+          echo "Selected scheme: $SCHEME"
 
-      - name: Build iOS app
+      - name: Build iOS app (no code signing)
         working-directory: apps/mobile/ios
         run: |
-          # Full output - no piping, no masking
           xcodebuild build \
             -workspace "$WORKSPACE" \
             -scheme "$SCHEME" \
             -configuration Release \
             -sdk iphoneos \
             -derivedDataPath "$RUNNER_TEMP/DerivedData" \
-            CODE_SIGN_IDENTITY="-" \
+            CODE_SIGNING_ALLOWED=NO \
             CODE_SIGNING_REQUIRED=NO \
-            CODE_SIGNING_ALLOWED=YES \
+            CODE_SIGN_IDENTITY="" \
             PROVISIONING_PROFILE=""
 
       - name: List DerivedData contents
         if: always()
         run: |
-          echo "=== All .app bundles found ==="
-          find "$RUNNER_TEMP/DerivedData" -name "*.app" 2>/dev/null || echo "None found"
-          echo "=== DerivedData top-level dirs ==="
-          find "$RUNNER_TEMP/DerivedData" -maxdepth 5 -type d 2>/dev/null | head -40
+          echo "=== Searching for .app bundles ==="
+          find "$RUNNER_TEMP/DerivedData" -name "*.app" 2>/dev/null || echo "No .app found"
+          echo ""
+          echo "=== Products directory ==="
+          find "$RUNNER_TEMP/DerivedData" -type d -name "Products" 2>/dev/null | while read d; do
+            echo "--- $d ---"
+            ls "$d" 2>/dev/null || true
+          done
 
       - name: Package as IPA
         run: |
           set -e
-          APP_PATH=$(find "$RUNNER_TEMP/DerivedData" -name "*.app" \
-            -not -path "*/PlugIns/*" \
-            -not -name "*.appex" \
-            2>/dev/null | head -1)
+          # Look in the standard build products location
+          APP_PATH=$(find "$RUNNER_TEMP/DerivedData" -path "*/Release-iphoneos/*.app" \
+            -not -name "*.appex" 2>/dev/null | head -1)
+
+          # Fallback: any .app not a plugin
+          if [ -z "$APP_PATH" ]; then
+            APP_PATH=$(find "$RUNNER_TEMP/DerivedData" -name "*.app" \
+              -not -path "*/PlugIns/*" \
+              -not -name "*.appex" 2>/dev/null | head -1)
+          fi
+
           echo "Found app: $APP_PATH"
           if [ -z "$APP_PATH" ]; then
-            echo "ERROR: No .app bundle found!"
+            echo "ERROR: No .app found. See 'List DerivedData contents' above."
             exit 1
           fi
+
           mkdir -p "$RUNNER_TEMP/Payload"
           cp -r "$APP_PATH" "$RUNNER_TEMP/Payload/"
           cd "$RUNNER_TEMP"
           zip -r T3Code-Preview.ipa Payload/
-          echo "IPA size: $(du -sh T3Code-Preview.ipa)"
+          echo "Done! IPA size: $(du -sh T3Code-Preview.ipa)"
 
       - name: Upload IPA
         uses: actions/upload-artifact@v4
