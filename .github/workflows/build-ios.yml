@@ -31,17 +31,36 @@ jobs:
           APP_VARIANT: preview
         run: npx expo prebuild --platform ios --clean --no-install
 
-      - name: Patch Podfile to fix Swift 5 + disable signing for all pods
+      # Fix 1: Xcode 16.x breaks xcodeproj gem — patch it before pod install
+      - name: Patch xcodeproj gem for Xcode 16
+        run: |
+          XCODEPROJ_CONSTANTS=$(gem contents xcodeproj | grep constants.rb | head -1)
+          if [ -n "$XCODEPROJ_CONSTANTS" ]; then
+            XCODE_VERSION=$(xcodebuild -version | head -1 | awk '{print $2}' | cut -d. -f1)
+            echo "Xcode major version: $XCODE_VERSION"
+            if [ "$XCODE_VERSION" -ge 16 ]; then
+              sudo sed -i '' \
+                "s/LAST_KNOWN_OBJECT_VERSION = [0-9]*/LAST_KNOWN_OBJECT_VERSION = 77/" \
+                "$XCODEPROJ_CONSTANTS" 2>/dev/null || true
+              echo "xcodeproj patched for Xcode 16"
+            fi
+          fi
+
+      # Fix 2: Patch Podfile to resolve Swift 6 MainActor/concurrency errors in ExpoModulesCore
+      # Root cause: Xcode 16 enables SWIFT_STRICT_CONCURRENCY=complete by default (Swift 6 mode)
+      # ExpoModulesCore 55.x is not yet fully Swift 6 concurrency-compliant
+      # Fix: set SWIFT_STRICT_CONCURRENCY=minimal for all pods (matches Swift 5 behavior)
+      - name: Patch Podfile for Swift concurrency + disable pod signing
         working-directory: apps/mobile/ios
         run: |
-          # Inject post_install hook to force Swift 5 and disable signing across all pods
-          # This fixes ExpoModulesCore Swift 6 strict concurrency errors
-          cat >> Podfile << 'EOF'
+          cat >> Podfile << 'PODFILE_PATCH'
 
           post_install do |installer|
             installer.pods_project.targets.each do |target|
               target.build_configurations.each do |config|
-                config.build_settings['SWIFT_VERSION'] = '5.0'
+                # Fix Swift 6 MainActor/concurrency errors (ExpoModulesCore, RNWorklets, etc.)
+                config.build_settings['SWIFT_STRICT_CONCURRENCY'] = 'minimal'
+                # Disable code signing for all pods (not needed for unsigned build)
                 config.build_settings['CODE_SIGNING_ALLOWED'] = 'NO'
                 config.build_settings['CODE_SIGNING_REQUIRED'] = 'NO'
                 config.build_settings['CODE_SIGN_IDENTITY'] = ''
@@ -49,14 +68,12 @@ jobs:
               end
             end
           end
-          EOF
-          echo "Podfile patched."
+          PODFILE_PATCH
+          echo "Podfile patched successfully."
 
       - name: Install CocoaPods dependencies
         working-directory: apps/mobile/ios
-        run: |
-          pod install --repo-update 2>&1
-          echo "=== Pod install complete ==="
+        run: pod install --repo-update
 
       - name: Find workspace and scheme
         working-directory: apps/mobile/ios
@@ -64,60 +81,50 @@ jobs:
           WORKSPACE=$(ls -d *.xcworkspace | head -1)
           echo "WORKSPACE=$WORKSPACE" >> $GITHUB_ENV
           echo "Found workspace: $WORKSPACE"
-          echo "=== All available schemes ==="
+          echo "=== All schemes ==="
           xcodebuild -workspace "$WORKSPACE" -list 2>&1
-          # Skip helper/lib schemes, pick the main app scheme
+          # Pick main app scheme — skip EASClient, Pods, Tests, and Expo helper targets
           SCHEME=$(xcodebuild -workspace "$WORKSPACE" -list 2>&1 \
             | awk '/Schemes:/,0' \
             | grep -v "Schemes:" \
             | grep -v "^$" \
-            | grep -v "EASClient" \
-            | grep -v "Pods" \
-            | grep -v "Tests" \
-            | grep -v "ExpoModulesCore" \
+            | grep -v -i "EASClient\|Pods\|Tests\|ExpoModules\|hermes\|React" \
             | head -1 \
             | xargs)
           echo "SCHEME=$SCHEME" >> $GITHUB_ENV
           echo "Selected scheme: $SCHEME"
 
-      - name: Build iOS app (no code signing)
+      # Fix 3: Use `archive` (not `build`) — produces proper .app in xcarchive/Products/Applications
+      - name: Archive iOS app (unsigned)
         working-directory: apps/mobile/ios
         run: |
-          xcodebuild build \
+          xcodebuild archive \
             -workspace "$WORKSPACE" \
             -scheme "$SCHEME" \
             -configuration Release \
             -sdk iphoneos \
-            -derivedDataPath "$RUNNER_TEMP/DerivedData" \
-            CODE_SIGNING_ALLOWED=NO \
-            CODE_SIGNING_REQUIRED=NO \
+            -destination "generic/platform=iOS" \
+            -archivePath "$RUNNER_TEMP/T3Code.xcarchive" \
             CODE_SIGN_IDENTITY="" \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGNING_ALLOWED=NO \
             PROVISIONING_PROFILE="" \
-            SWIFT_VERSION=5.0 \
-            OTHER_SWIFT_FLAGS="-suppress-warnings" \
+            SKIP_INSTALL=NO \
             GCC_WARN_INHIBIT_ALL_WARNINGS=YES
-
-      - name: List DerivedData contents
-        if: always()
-        run: |
-          echo "=== All .app bundles ==="
-          find "$RUNNER_TEMP/DerivedData" -name "*.app" 2>/dev/null || echo "None found"
-          echo "=== Products dirs ==="
-          find "$RUNNER_TEMP/DerivedData" -type d -name "Products" 2>/dev/null | while read d; do
-            echo "--- $d ---"; ls "$d" 2>/dev/null || true
-          done
 
       - name: Package as IPA
         run: |
           set -e
-          APP_PATH=$(find "$RUNNER_TEMP/DerivedData" -path "*/Release-iphoneos/*.app" \
+          ARCHIVE="$RUNNER_TEMP/T3Code.xcarchive"
+          echo "=== Archive contents ==="
+          find "$ARCHIVE" -name "*.app" 2>/dev/null || echo "No .app in archive"
+
+          APP_PATH=$(find "$ARCHIVE/Products/Applications" -name "*.app" \
             -not -name "*.appex" 2>/dev/null | head -1)
-          if [ -z "$APP_PATH" ]; then
-            APP_PATH=$(find "$RUNNER_TEMP/DerivedData" -name "*.app" \
-              -not -path "*/PlugIns/*" -not -name "*.appex" 2>/dev/null | head -1)
-          fi
+
           echo "Found app: $APP_PATH"
-          [ -z "$APP_PATH" ] && echo "ERROR: No .app found!" && exit 1
+          [ -z "$APP_PATH" ] && echo "ERROR: No .app found in archive!" && exit 1
+
           mkdir -p "$RUNNER_TEMP/Payload"
           cp -r "$APP_PATH" "$RUNNER_TEMP/Payload/"
           cd "$RUNNER_TEMP" && zip -r T3Code-Preview.ipa Payload/
