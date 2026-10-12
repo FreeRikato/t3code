@@ -12,11 +12,9 @@ import {
   OrchestratorMcpThreadReadResult,
   ProviderDriverKind,
   ProviderInstanceId,
-  RunId,
   ThreadId,
   TurnItemId,
   type OrchestrationV2ProjectedTurnItem,
-  type OrchestrationV2ThreadShell,
 } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
 import * as TestClock from "effect/testing/TestClock";
@@ -33,6 +31,7 @@ import {
 } from "../../orchestration-v2/Orchestrator.ts";
 
 import * as ServerSecretStore from "../../auth/ServerSecretStore.ts";
+import * as HtmlPreviewStore from "../../htmlRender/HtmlPreviewStore.ts";
 import * as ServerConfig from "../../config.ts";
 import * as ProviderAdapterRegistry from "../../orchestration-v2/ProviderAdapterRegistry.ts";
 import * as ThreadManagement from "../../orchestration-v2/ThreadManagementService.ts";
@@ -262,6 +261,17 @@ it("bounds public command rejections and redacts internal dispatch causes", () =
   });
 });
 
+const layerHtmlTools = McpHttpServer.layerHtmlToolkit.pipe(
+  Layer.provideMerge(McpServer.McpServer.layer),
+  Layer.provideMerge(HtmlPreviewStore.layer),
+  Layer.provide(PreviewBrowser.layer),
+  Layer.provide(ServerConfig.layerTest(process.cwd(), { prefix: "t3-mcp-html-" })),
+  Layer.provide(NodeServices.layer),
+  Layer.provide(NodeCrypto.layer),
+  Layer.provide(FetchHttpClient.layer),
+  Layer.provide(McpToolAccessTestkit.liveThreadsLayer),
+);
+
 it.effect("returns an HTML render reference that Codex and Claude tool rows both carry", () =>
   Effect.gen(function* () {
     const server = yield* McpServer.McpServer;
@@ -282,32 +292,109 @@ it.effect("returns an HTML render reference that Codex and Claude tool rows both
     expect(
       htmlRenderFromToolItem({ toolName: "mcp__t3-code__html_render", output: result.content }),
     ).toEqual(reference);
-  }).pipe(
-    Effect.provide(
-      McpHttpServer.layerHtmlToolkit.pipe(
-        Layer.provideMerge(McpServer.McpServer.layer),
-        Layer.provide(PreviewBrowser.layer),
-        Layer.provide(ServerConfig.layerTest(process.cwd(), { prefix: "t3-mcp-html-render-" })),
-        Layer.provide(NodeServices.layer),
-        // The preview browser is not installed in a fresh home, so nothing downloads.
-        Layer.provide(FetchHttpClient.layer),
-        Layer.provide(
-          Layer.mock(ThreadManagement.ThreadManagementService)({
-            // A live run: publishing stores a page, so it needs the caller's active turn.
-            getThreadShell: () =>
-              Effect.succeed({
-                id: threadId,
-                deletedAt: null,
-                archivedAt: null,
-                activeRunId: RunId.make("mcp-core-run"),
-                providerInstanceId: ProviderInstanceId.make("codex"),
-              } as OrchestrationV2ThreadShell),
-          }),
-        ),
-      ),
-    ),
-  ),
+  }).pipe(Effect.provide(layerHtmlTools)),
 );
+
+const callHtmlTool = (name: "html_render" | "html_preview", args: Record<string, unknown>) =>
+  McpServer.McpServer.pipe(
+    Effect.flatMap((server) => server.callTool({ name, arguments: args })),
+    Effect.provideService(McpInvocationContext.McpInvocationContext, scope),
+    Effect.provideService(McpSchema.McpServerClient, client),
+  );
+
+it.effect("renders a remembered page by previewId and rejects an id it cannot use", () =>
+  Effect.gen(function* () {
+    const store = yield* HtmlPreviewStore.HtmlPreviewStore;
+    const previewId = yield* store.remember(threadId, "<p>Revenue</p>");
+
+    const rendered = yield* callHtmlTool("html_render", {
+      previewId,
+      title: "Revenue",
+      height: 240,
+    });
+    expect(
+      htmlRenderFromToolItem({
+        toolName: "t3-code.html_render",
+        output: rendered.structuredContent,
+      }),
+    ).toMatchObject({ title: "Revenue", height: 240 });
+
+    const unknown = yield* callHtmlTool("html_render", {
+      previewId: "never-issued",
+      title: "Revenue",
+      height: 240,
+    });
+    expect(declaredFailure(unknown)).toMatchObject({
+      code: "invalid_request",
+      message: expect.stringContaining("send `html` again"),
+    });
+    for (const args of [
+      { html: "<p>x</p>", previewId, title: "Revenue", height: 240 },
+      { title: "Revenue", height: 240 },
+    ]) {
+      expect(declaredFailure(yield* callHtmlTool("html_render", args))).toMatchObject({
+        code: "invalid_request",
+        message: expect.stringContaining("exactly one"),
+      });
+    }
+  }).pipe(Effect.provide(layerHtmlTools)),
+);
+
+it.effect("refuses html_preview with an unknown id, both inputs, or neither", () =>
+  Effect.gen(function* () {
+    const store = yield* HtmlPreviewStore.HtmlPreviewStore;
+    const previewId = yield* store.remember(threadId, "<p>Revenue</p>");
+    const messages = [];
+    for (const args of [{ previewId: "never-issued" }, { html: "<p>x</p>", previewId }, {}]) {
+      const result = yield* callHtmlTool("html_preview", args);
+      const text = result.content[0];
+      expect(result.isError).toBe(true);
+      expect(result.structuredContent).toMatchObject({ error: { code: "invalid_request" } });
+      messages.push(text?.type === "text" ? text.text : "");
+    }
+    expect(messages[0]).toContain("send `html` again");
+    expect(messages[1]).toContain("exactly one");
+    expect(messages[2]).toContain("exactly one");
+  }).pipe(Effect.provide(layerHtmlTools)),
+);
+
+it.effect("answers another thread's previewId like an unknown one in both HTML tools", () =>
+  Effect.gen(function* () {
+    const store = yield* HtmlPreviewStore.HtmlPreviewStore;
+    const foreignId = yield* store.remember(ThreadId.make("mcp-other-thread"), "<p>Private</p>");
+    const preview = yield* callHtmlTool("html_preview", { previewId: foreignId });
+    expect(preview.structuredContent).toMatchObject({
+      error: { code: "invalid_request", message: expect.stringContaining("send `html` again") },
+    });
+    expect(
+      declaredFailure(
+        yield* callHtmlTool("html_render", { previewId: foreignId, title: "X", height: 240 }),
+      ),
+    ).toMatchObject({
+      code: "invalid_request",
+      message: expect.stringContaining("send `html` again"),
+    });
+  }).pipe(Effect.provide(layerHtmlTools)),
+);
+
+it.effect("answers an oversized previewId like an unknown one without echoing it", () =>
+  Effect.gen(function* () {
+    const previewId = "x".repeat(65_536);
+    const preview = yield* callHtmlTool("html_preview", { previewId });
+    expect(preview.structuredContent).toMatchObject({ error: { code: "invalid_request" } });
+    const render = yield* callHtmlTool("html_render", { previewId, title: "X", height: 240 });
+    expect(declaredFailure(render)).toMatchObject({ code: "invalid_request" });
+    for (const result of [preview, render]) {
+      expect(JSON.stringify(result).length).toBeLessThan(2_000);
+    }
+  }).pipe(Effect.provide(layerHtmlTools)),
+);
+
+it("tells the agent both HTML tools take a previewId", () => {
+  for (const tool of Object.values(HtmlToolkit.tools)) {
+    expect(Tool.getDescription(tool), tool.name).toContain("previewId");
+  }
+});
 
 it.effect("returns invalid parameter errors through the production registration", () =>
   Effect.gen(function* () {

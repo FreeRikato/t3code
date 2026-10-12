@@ -32,6 +32,7 @@ import { createAttachmentId } from "../attachmentStore.ts";
 import { resolveRootCliCommand } from "../cli/invocation.ts";
 import * as ServerConfig from "../config.ts";
 import * as HeadlessChrome from "./headlessChrome.ts";
+import * as HtmlPreviewStore from "./HtmlPreviewStore.ts";
 import * as PreviewBrowser from "../preview/PreviewBrowser.ts";
 import * as PreviewBrowserHost from "../preview/PreviewBrowserHost.ts";
 
@@ -76,12 +77,38 @@ export class HtmlRenderStoreError extends Schema.TaggedError<HtmlRenderStoreErro
   }
 }
 
+export class HtmlRenderPreviewNotFoundError extends Schema.TaggedError<HtmlRenderPreviewNotFoundError>()(
+  "HtmlRenderPreviewNotFoundError",
+  {},
+) {
+  override get message(): string {
+    return "This previewId is unknown or has expired: ids last 30 minutes, work only in the thread that previewed the page, and are lost when T3 restarts. Please send `html` again.";
+  }
+}
+
+export class HtmlRenderSourceError extends Schema.TaggedError<HtmlRenderSourceError>()(
+  "HtmlRenderSourceError",
+  {},
+) {
+  override get message(): string {
+    return "Pass exactly one of `html` or `previewId`.";
+  }
+}
+
+export type HtmlRenderResolveError = HtmlRenderPreviewNotFoundError | HtmlRenderSourceError;
+
+export interface HtmlRenderPageSource {
+  readonly html?: string | undefined;
+  readonly previewId?: string | undefined;
+}
+
 export type HtmlRenderPrepareError =
   | HtmlRenderImagesNotFoundError
   | HtmlRenderImageTooLargeError
   | HtmlRenderPageTooLargeError;
 
 export interface HtmlPreview {
+  readonly previewId: string;
   /** Base64 PNG of the top `capturedHeight` pixels. */
   readonly png: string;
   readonly width: number;
@@ -103,19 +130,26 @@ export class HtmlRender extends Context.Service<
      * measuring its height at each client width when the preview browser is
      * already installed.
      */
-    readonly publish: (input: {
-      readonly threadId: ThreadId;
-      readonly html: string;
-      readonly title: string;
-      readonly height: number;
-    }) => Effect.Effect<HtmlRenderReference, HtmlRenderPrepareError | HtmlRenderStoreError>;
+    readonly publish: (
+      input: HtmlRenderPageSource & {
+        readonly threadId: ThreadId;
+        readonly title: string;
+        readonly height: number;
+      },
+    ) => Effect.Effect<
+      HtmlRenderReference,
+      HtmlRenderResolveError | HtmlRenderPrepareError | HtmlRenderStoreError
+    >;
     /** Screenshots a page in headless Chrome, tolerating unreadable local images. */
-    readonly preview: (input: {
-      readonly html: string;
-      readonly width?: number | undefined;
-      readonly appearance?: ThemeAppearance | undefined;
-    }) => Effect.Effect<
+    readonly preview: (
+      input: HtmlRenderPageSource & {
+        readonly threadId: ThreadId;
+        readonly width?: number | undefined;
+        readonly appearance?: ThemeAppearance | undefined;
+      },
+    ) => Effect.Effect<
       HtmlPreview,
+      | HtmlRenderResolveError
       | Exclude<HtmlRenderPrepareError, HtmlRenderImagesNotFoundError>
       | PreviewBrowser.PreviewBrowserInstallError
       | PreviewBrowser.PreviewBrowserInstallingError
@@ -335,6 +369,7 @@ const make = Effect.gen(function* () {
   const fileSystem = yield* FileSystem.FileSystem;
   const config = yield* ServerConfig.ServerConfig;
   const previewBrowser = yield* PreviewBrowser.PreviewBrowser;
+  const previewStore = yield* HtmlPreviewStore.HtmlPreviewStore;
   const services = yield* Effect.context<
     FileSystem.FileSystem | Path.Path | ChildProcessSpawner.ChildProcessSpawner
   >();
@@ -413,13 +448,29 @@ const make = Effect.gen(function* () {
     return inlined.html;
   });
 
-  const publish = Effect.fn("HtmlRender.publish")(function* (input: {
-    readonly threadId: ThreadId;
-    readonly html: string;
-    readonly title: string;
-    readonly height: number;
-  }) {
-    const html = yield* prepare(input.html);
+  const resolvePage = Effect.fn("HtmlRender.resolvePage")(function* (
+    threadId: ThreadId,
+    source: HtmlRenderPageSource,
+  ) {
+    const { html, previewId } = source;
+    if (html !== undefined && previewId === undefined) return { html, previewId: undefined };
+    if (html === undefined && previewId !== undefined) {
+      const remembered = yield* previewStore.recall(threadId, previewId);
+      if (Option.isSome(remembered)) return { html: remembered.value, previewId };
+      return yield* new HtmlRenderPreviewNotFoundError();
+    }
+    return yield* new HtmlRenderSourceError();
+  });
+
+  const publish = Effect.fn("HtmlRender.publish")(function* (
+    input: HtmlRenderPageSource & {
+      readonly threadId: ThreadId;
+      readonly title: string;
+      readonly height: number;
+    },
+  ) {
+    const page = yield* resolvePage(input.threadId, input);
+    const html = yield* prepare(page.html);
     // The `-html` id suffix makes the asset route serve it as a sandboxed text/html document.
     const attachmentId = createAttachmentId(input.threadId, "html");
     const filePath =
@@ -447,17 +498,20 @@ const make = Effect.gen(function* () {
     } satisfies HtmlRenderReference;
   });
 
-  const preview = Effect.fn("HtmlRender.preview")(function* (input: {
-    readonly html: string;
-    readonly width?: number | undefined;
-    readonly appearance?: ThemeAppearance | undefined;
-  }) {
+  const preview = Effect.fn("HtmlRender.preview")(function* (
+    input: HtmlRenderPageSource & {
+      readonly threadId: ThreadId;
+      readonly width?: number | undefined;
+      readonly appearance?: ThemeAppearance | undefined;
+    },
+  ) {
     const width = Math.min(
       MAX_PREVIEW_WIDTH,
       Math.max(MIN_PREVIEW_WIDTH, Math.round(input.width ?? HTML_RENDER_COLUMN_WIDTH)),
     );
     const appearance = input.appearance ?? "dark";
-    const inlined = yield* inline(input.html);
+    const page = yield* resolvePage(input.threadId, input);
+    const inlined = yield* inline(page.html);
     const executable = yield* previewBrowser.executable;
     const theme = htmlRenderTheme(
       appearance === "light" ? T3_CODE_LIGHT_THEME_COLORS : T3_CODE_DARK_THEME_COLORS,
@@ -473,8 +527,10 @@ const make = Effect.gen(function* () {
         urlFragment: htmlRenderThemeFragment(theme),
       }).pipe(Effect.provideContext(services)),
     );
+    const previewId = page.previewId ?? (yield* previewStore.remember(input.threadId, page.html));
     return {
       ...screenshot,
+      previewId,
       width,
       ...(inlined.missing.length === 0 ? {} : { missingImages: inlined.missing }),
     } satisfies HtmlPreview;

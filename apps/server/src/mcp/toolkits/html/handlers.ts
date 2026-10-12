@@ -10,6 +10,8 @@ const INVALID_PAGE_ERRORS = new Set([
   "HtmlRenderImagesNotFoundError",
   "HtmlRenderImageTooLargeError",
   "HtmlRenderPageTooLargeError",
+  "HtmlRenderPreviewNotFoundError",
+  "HtmlRenderSourceError",
 ]);
 
 // Every HTML render error message is built on the server and tells the agent what to do next.
@@ -24,8 +26,12 @@ const handlers = {
   // agents T3 launched, which already work on this machine, get it.
   html_preview: McpToolAccess.readsAsCaller((input) =>
     Effect.gen(function* () {
+      const scope = yield* McpInvocationContext.McpInvocationContext;
+      const { thread } = yield* McpInvocationContext.requireThreadScope(scope, "html_preview");
       const htmlRender = yield* HtmlRender.HtmlRender;
-      const { png, ...preview } = yield* htmlRender.preview(input).pipe(Effect.mapError(toFailure));
+      const { png, ...preview } = yield* htmlRender
+        .preview({ threadId: thread.threadId, ...input })
+        .pipe(Effect.mapError(toFailure));
       return {
         ...preview,
         screenshot: {

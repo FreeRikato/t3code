@@ -33,7 +33,7 @@ ACP fallback: some ACP agents accept the injected MCP server but fail to expose 
 
 ### Showing visuals
 
-When a chart, table, diagram, image collage, or mockup would say more than prose, build a self-contained HTML page, check it with \`html_preview\`, then publish it with \`html_render\` before your final reply. The reader sees the page above that reply, so don't announce or restate it; add only what it doesn't say.
+When a chart, table, diagram, image collage, or mockup would say more than prose, build a self-contained HTML page, check it with \`html_preview\`, then publish it with \`html_render\` before your final reply. Send the page's HTML once: \`html_preview\` returns a \`previewId\`, so pass that instead of \`html\` for further previews and for \`html_render\`. The reader sees the page above that reply, so don't announce or restate it; add only what it doesn't say.
 `;
 
 export const T3_CODE_BROWSER_TOOL_INSTRUCTIONS = `

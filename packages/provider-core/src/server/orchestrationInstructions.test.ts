@@ -26,6 +26,14 @@ describe("T3 orchestration provider instructions", () => {
     assert.include(T3_CODE_ORCHESTRATION_INSTRUCTIONS, "bindToCurrentThread=false");
   });
 
+  it("teaches sending a visual's HTML once and reusing its previewId", () => {
+    assert.include(T3_CODE_ORCHESTRATION_INSTRUCTIONS, "Send the page's HTML once");
+    assert.include(
+      T3_CODE_ORCHESTRATION_INSTRUCTIONS,
+      "pass that instead of `html` for further previews and for `html_render`",
+    );
+  });
+
   it("injects prompt fallback only for an MCP-enabled first run", () => {
     const prompt = "Inspect the repository.";
     const injected = t3OrchestrationPromptForFirstRun({

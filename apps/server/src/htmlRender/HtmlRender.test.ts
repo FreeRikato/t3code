@@ -10,6 +10,7 @@ import {
 } from "@t3tools/shared/htmlRender";
 import { T3_CODE_DARK_THEME_COLORS } from "@t3tools/shared/themePalettes";
 import * as Deferred from "effect/Deferred";
+import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as Base64 from "effect/encoding/Base64";
 import * as Fiber from "effect/Fiber";
@@ -17,12 +18,14 @@ import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Path from "effect/Path";
+import * as TestClock from "effect/testing/TestClock";
 import * as NodeDgram from "node:dgram";
 import * as NodeHttp from "node:http";
 import * as NodeURL from "node:url";
 
 import { resolveAttachmentPathById } from "../attachmentStore.ts";
 import * as ServerConfig from "../config.ts";
+import * as HtmlPreviewStore from "./HtmlPreviewStore.ts";
 import * as HtmlRender from "./HtmlRender.ts";
 import * as PreviewBrowser from "../preview/PreviewBrowser.ts";
 
@@ -49,10 +52,21 @@ const layerHtmlRender = (
         }),
       ),
     ),
+    Layer.provideMerge(HtmlPreviewStore.layer),
     Layer.provideMerge(ServerConfig.layerTest(process.cwd(), { prefix: "t3-html-render-" })),
     Layer.provideMerge(NodeServices.layer),
   );
 const layerTest = layerHtmlRender();
+
+const thread = ThreadId.make("thread-html-preview-id");
+
+const failureOf = (
+  attempt: Effect.Effect<unknown, { readonly _tag: string; readonly message: string }>,
+) =>
+  Effect.match(attempt, {
+    onFailure: ({ _tag, message }) => ({ _tag, message }),
+    onSuccess: () => ({ _tag: "succeeded", message: "" }),
+  });
 
 const PNG_BYTES = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
 
@@ -200,6 +214,158 @@ describe("HtmlRender", () => {
     }).pipe(Effect.provide(layerTest)),
   );
 
+  it.effect("publishes a remembered page by id exactly as it publishes the same html", () =>
+    Effect.gen(function* () {
+      const fileSystem = yield* FileSystem.FileSystem;
+      const config = yield* ServerConfig.ServerConfig;
+      const store = yield* HtmlPreviewStore.HtmlPreviewStore;
+      const htmlRender = yield* HtmlRender.HtmlRender;
+      const html = "<p>Quarterly revenue</p>";
+      const previewId = yield* store.remember(thread, html);
+      const storedHtml = (reference: { readonly attachmentId: string }) =>
+        fileSystem.readFileString(
+          resolveAttachmentPathById({
+            attachmentsDir: config.attachmentsDir,
+            attachmentId: reference.attachmentId,
+          }) ?? "",
+        );
+
+      const byId = yield* htmlRender.publish({
+        threadId: thread,
+        previewId,
+        title: "Rev",
+        height: 300,
+      });
+      const byHtml = yield* htmlRender.publish({
+        threadId: thread,
+        html,
+        title: "Rev",
+        height: 300,
+      });
+
+      expect(yield* storedHtml(byId)).toEqual(yield* storedHtml(byHtml));
+      expect({ ...byId, attachmentId: "" }).toEqual({ ...byHtml, attachmentId: "" });
+    }).pipe(Effect.provide(layerTest)),
+  );
+
+  it.effect("tells the agent to send html again for an unknown, expired, or foreign id", () =>
+    Effect.gen(function* () {
+      const store = yield* HtmlPreviewStore.HtmlPreviewStore;
+      const htmlRender = yield* HtmlRender.HtmlRender;
+      const previewId = yield* store.remember(thread, "<p>x</p>");
+      yield* TestClock.adjust(Duration.minutes(30));
+      const attempts = [
+        htmlRender.publish({
+          threadId: thread,
+          previewId: "never-issued",
+          title: "X",
+          height: 200,
+        }),
+        htmlRender.publish({ threadId: thread, previewId, title: "X", height: 200 }),
+        htmlRender.preview({ threadId: thread, previewId }),
+        htmlRender.preview({ threadId: ThreadId.make("another-thread"), previewId }),
+      ];
+      for (const attempt of attempts) {
+        const error = yield* failureOf(attempt);
+        expect(error._tag).toBe("HtmlRenderPreviewNotFoundError");
+        expect(error.message).toContain("send `html` again");
+      }
+    }).pipe(Effect.provide(layerTest)),
+  );
+
+  it.effect("answers another thread's unexpired id like an unknown one, without echoing ids", () =>
+    Effect.gen(function* () {
+      const store = yield* HtmlPreviewStore.HtmlPreviewStore;
+      const htmlRender = yield* HtmlRender.HtmlRender;
+      const foreignThread = ThreadId.make("another-thread");
+      const previewId = yield* store.remember(foreignThread, "<p>Private</p>");
+      const foreign = [
+        htmlRender.publish({ threadId: thread, previewId, title: "X", height: 200 }),
+        htmlRender.preview({ threadId: thread, previewId }),
+      ];
+      const unknown = yield* failureOf(
+        htmlRender.preview({ threadId: thread, previewId: "never-issued" }),
+      );
+      for (const attempt of foreign) {
+        expect(yield* failureOf(attempt)).toEqual(unknown);
+      }
+      expect(unknown._tag).toBe("HtmlRenderPreviewNotFoundError");
+      expect(unknown.message).not.toContain("never-issued");
+    }).pipe(Effect.provide(layerTest)),
+  );
+
+  it.effect("requires exactly one of html and previewId and publishes nothing otherwise", () =>
+    Effect.gen(function* () {
+      const fileSystem = yield* FileSystem.FileSystem;
+      const config = yield* ServerConfig.ServerConfig;
+      const store = yield* HtmlPreviewStore.HtmlPreviewStore;
+      const htmlRender = yield* HtmlRender.HtmlRender;
+      const previewId = yield* store.remember(thread, "<p>x</p>");
+      const attempts = [
+        htmlRender.publish({
+          threadId: thread,
+          html: "<p>x</p>",
+          previewId,
+          title: "X",
+          height: 200,
+        }),
+        htmlRender.publish({ threadId: thread, title: "X", height: 200 }),
+        htmlRender.preview({ threadId: thread, html: "<p>x</p>", previewId }),
+        htmlRender.preview({ threadId: thread }),
+      ];
+      for (const attempt of attempts) {
+        const error = yield* failureOf(attempt);
+        expect(error._tag).toBe("HtmlRenderSourceError");
+        expect(error.message).toContain("exactly one");
+      }
+      const names = yield* fileSystem.readDirectory(config.attachmentsDir, { recursive: true });
+      expect(names.filter((name) => name.endsWith(".html"))).toEqual([]);
+    }).pipe(Effect.provide(layerTest)),
+  );
+
+  it.live(
+    "previews and publishes a page by the id its first preview returned",
+    (ctx) =>
+      Effect.gen(function* () {
+        const executable = (yield* HostProcess.Environment)[TEST_BROWSER_ENV];
+        if (!executable) return ctx.skip(`Set ${TEST_BROWSER_ENV} to run this test.`);
+        yield* Effect.gen(function* () {
+          const fileSystem = yield* FileSystem.FileSystem;
+          const config = yield* ServerConfig.ServerConfig;
+          const htmlRender = yield* HtmlRender.HtmlRender;
+          const html =
+            '<!doctype html><html><head></head><body><div style="height:120px;background:var(--accent)"></div></body></html>';
+
+          const first = yield* htmlRender.preview({ threadId: thread, html });
+          const again = yield* htmlRender.preview({
+            threadId: thread,
+            previewId: first.previewId,
+            width: 390,
+            appearance: "light",
+          });
+          const reference = yield* htmlRender.publish({
+            threadId: thread,
+            previewId: first.previewId,
+            title: "By id",
+            height: 200,
+          });
+
+          const png = Buffer.from(again.png, "base64");
+          expect([png.readUInt32BE(16), png.readUInt32BE(20)]).toEqual([390, 120]);
+          expect(again.previewId).toBe(first.previewId);
+          expect(
+            yield* fileSystem.readFileString(
+              resolveAttachmentPathById({
+                attachmentsDir: config.attachmentsDir,
+                attachmentId: reference.attachmentId,
+              }) ?? "",
+            ),
+          ).toContain("background:var(--accent)");
+        }).pipe(Effect.provide(layerHtmlRender(executable)));
+      }),
+    30_000,
+  );
+
   it.effect("removes the page when publishing is interrupted", () =>
     Effect.gen(function* () {
       const measuring = yield* Deferred.make<void>();
@@ -243,6 +409,7 @@ describe("HtmlRender", () => {
         yield* Effect.gen(function* () {
           const htmlRender = yield* HtmlRender.HtmlRender;
           const preview = yield* htmlRender.preview({
+            threadId: thread,
             html: [
               '<!doctype html><html><head></head><body><div id="page" tabindex="0" style="height:300px;background:var(--accent)"></div>',
               '<img src="/nonexistent/t3-missing.png" hidden>',
@@ -307,6 +474,7 @@ describe("HtmlRender", () => {
           const secretUrl = NodeURL.pathToFileURL(secret).href;
 
           const preview = yield* htmlRender.preview({
+            threadId: thread,
             html: [
               `<script src="${secretUrl}"></script>`,
               `<iframe src="${secretUrl}" onload="console.log('frame loaded')"></iframe>`,
@@ -363,6 +531,7 @@ describe("HtmlRender", () => {
         yield* Effect.gen(function* () {
           const htmlRender = yield* HtmlRender.HtmlRender;
           yield* htmlRender.preview({
+            threadId: thread,
             html: [
               `<img src="${origin}/x.png"><iframe src="${origin}/"></iframe>`,
               `<script type="speculationrules">{"prefetch":[{"source":"list","urls":["${origin}/prefetch"]}]}</script>`,

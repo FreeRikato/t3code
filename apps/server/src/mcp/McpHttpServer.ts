@@ -18,6 +18,7 @@ import { OrchestratorMcpFailure, PreviewAutomationError } from "@t3tools/contrac
 import packageJson from "../../package.json" with { type: "json" };
 import * as ServerConfig from "../config.ts";
 import * as DeviceService from "../device/DeviceService.ts";
+import * as HtmlPreviewStore from "../htmlRender/HtmlPreviewStore.ts";
 import * as HtmlRender from "../htmlRender/HtmlRender.ts";
 import * as ThreadCommandExecutor from "../orchestration-v2/ThreadCommandExecutor.ts";
 import * as ThreadManagementService from "../orchestration-v2/ThreadManagementService.ts";
@@ -579,13 +580,22 @@ interface ImageToolResult {
   readonly [key: string]: unknown;
 }
 
+interface ImageToolFailureDescription {
+  readonly message: string;
+  readonly code?: string;
+}
+
 /**
  * Failures surface only their tag unless the tool describes them: the remote
  * message may carry renderer or device output the agent should not see, and
  * the tag is what it can act on. A describer returns a server-built message.
  */
 const imageToolFailure =
-  <E>(toolName: string, operation: string, failureText: string | ((error: E) => string)) =>
+  <E>(
+    toolName: string,
+    operation: string,
+    failureText: string | ((error: E) => ImageToolFailureDescription),
+  ) =>
   (cause: Cause.Cause<E>) => {
     if (Cause.hasInterrupts(cause) || cause.reasons.some(Cause.isDieReason)) {
       return Effect.failCause(cause).pipe(Effect.orDie);
@@ -599,7 +609,7 @@ const imageToolFailure =
       typeof firstFailure._tag === "string"
         ? firstFailure._tag
         : `${toolName}Error`;
-    const message =
+    const description =
       typeof failureText === "string" || failures[0] === undefined
         ? undefined
         : failureText(failures[0].error);
@@ -610,14 +620,17 @@ const imageToolFailure =
           _tag: errorTag,
           operation,
           failureCount: failures.length,
-          ...(message === undefined ? {} : { message }),
+          ...description,
         },
       },
       // Some clients show only the text content and others only structuredContent, so both carry it.
       content: [
         {
           type: "text",
-          text: typeof failureText === "string" ? failureText : (message ?? `${toolName} failed.`),
+          text:
+            typeof failureText === "string"
+              ? failureText
+              : (description?.message ?? `${toolName} failed.`),
         },
       ],
     });
@@ -645,7 +658,7 @@ const registerImageTool = <T extends Tool.Any, E, R>(
     McpInvocationContext.McpInvocationContext
   >,
   operation: string,
-  failureText: string | ((error: E) => string),
+  failureText: string | ((error: E) => ImageToolFailureDescription),
 ) =>
   Effect.gen(function* () {
     const server = yield* McpServer.McpServer;
@@ -754,9 +767,9 @@ const registerHtmlPreview = Effect.fn("McpHttpServer.registerHtmlPreview")(funct
     "preview",
     // Parameter errors and HTML render errors are both written by the server for the agent.
     (error) =>
-      isOrchestratorMcpFailure(error) || AiError.isAiError(error)
-        ? error.message
-        : "HTML preview failed.",
+      isOrchestratorMcpFailure(error)
+        ? { message: error.message, code: error.code }
+        : { message: AiError.isAiError(error) ? error.message : "HTML preview failed." },
   );
 });
 
@@ -792,7 +805,7 @@ const imageToolRegistration = <Tools extends Record<string, Tool.Any>, A, E, R, 
 export const layerHtmlToolkit = Layer.mergeAll(
   toolkitRegistration(HtmlRenderToolkit, HtmlHandlers.layerRender),
   imageToolRegistration(registerHtmlPreview(), HtmlHandlers.layerPreview),
-).pipe(Layer.provide(HtmlRender.layer));
+).pipe(Layer.provide(HtmlRender.layer), Layer.provide(HtmlPreviewStore.layer));
 
 const layerPreviewStandardToolkitRegistration = toolkitRegistration(
   PreviewStandardToolkit,

@@ -19,13 +19,23 @@ const Html = Schema.String.check(Schema.isMinLength(1), Schema.isMaxLength(512_0
   description: "A complete, self-contained HTML document.",
 });
 
+const HtmlOrPreviewId = {
+  html: Schema.optional(Html),
+  previewId: Schema.optional(
+    Schema.String.check(Schema.isMinLength(1)).annotate({
+      description:
+        "The previewId an earlier html_preview returned for this page in this thread, instead of html. Pass exactly one of html or previewId.",
+    }),
+  ),
+};
+
 const PAGE_RULES =
   'Write one self-contained document with inline <style> and <script>. Local images written as absolute file paths (src="/abs/shot.png", CSS url(/abs/bg.webp), or a JS string) are inlined automatically; remote http(s) URLs, such as a CDN chart library, load as-is.';
 
 export const HtmlPreviewTool = Tool.make("html_preview", {
-  description: `Render an HTML page in T3's headless browser and get back a PNG screenshot, contentHeight (the height the page needs at this width), and its console output: log, info, warning, error, and uncaught exceptions, with stack traces pointing into page.html. console.log is a fine way to report your own checks. Use it to check and iterate on a page before html_render. The first preview on a machine can report that T3 is still installing its preview browser; call again a minute later. ${PAGE_RULES} The page gets the theme variables and layout described in html_render.`,
+  description: `Render an HTML page in T3's headless browser and get back a PNG screenshot, contentHeight (the height the page needs at this width), and its console output: log, info, warning, error, and uncaught exceptions, with stack traces pointing into page.html. console.log is a fine way to report your own checks. Use it to check and iterate on a page before html_render. The result includes a previewId: send the page as html once, then pass previewId instead of html to preview it again (another width or theme) and to html_render, rather than resending the page. A previewId lasts 30 minutes, works only in this thread, and is lost when T3 restarts; then send html again. The first preview on a machine can report that T3 is still installing its preview browser; call again a minute later. ${PAGE_RULES} The page gets the theme variables and layout described in html_render.`,
   parameters: Schema.Struct({
-    html: Html,
+    ...HtmlOrPreviewId,
     width: Schema.optional(
       Schema.Int.annotate({
         description: `Viewport width in CSS pixels, 240-1600. Defaults to ${HTML_RENDER_COLUMN_WIDTH}, the reply column; use about 390 to check phones.`,
@@ -38,6 +48,7 @@ export const HtmlPreviewTool = Tool.make("html_preview", {
     ),
   }),
   success: Schema.Struct({
+    previewId: Schema.String,
     width: Schema.Int,
     contentHeight: Schema.Int,
     capturedHeight: Schema.Int,
@@ -72,9 +83,9 @@ export const HtmlPreviewTool = Tool.make("html_preview", {
 // touches no workspace, so plan mode and read-only sandboxes can use it.
 // Open-world, since the page may load remote resources, as in a preview.
 const HtmlRenderTool = Tool.make(HTML_RENDER_TOOL_NAME, {
-  description: `Show a finished HTML page (chart, table, diagram, collage, mockup) inline in this thread, above your final text reply; call it before writing that reply. The reader already sees the page, so the reply should not announce it, say where it is, or restate it: add only what the page doesn't say. Preview with html_preview first. T3 fits the frame to the page's height at each reader's width. A height below the page's contentHeight caps the frame there, and the rest scrolls inside it. ${PAGE_RULES} ${HTML_RENDER_LAYOUT_GUIDE} ${HTML_RENDER_THEME_GUIDE}`,
+  description: `Show a finished HTML page (chart, table, diagram, collage, mockup) inline in this thread, above your final text reply; call it before writing that reply. The reader already sees the page, so the reply should not announce it, say where it is, or restate it: add only what the page doesn't say. Preview with html_preview first, then pass its previewId instead of html so the page is not sent again. T3 fits the frame to the page's height at each reader's width. A height below the page's contentHeight caps the frame there, and the rest scrolls inside it. ${PAGE_RULES} ${HTML_RENDER_LAYOUT_GUIDE} ${HTML_RENDER_THEME_GUIDE}`,
   parameters: Schema.Struct({
-    html: Html,
+    ...HtmlOrPreviewId,
     title: Schema.String.check(
       Schema.isMinLength(1),
       Schema.isMaxLength(HTML_RENDER_MAX_TITLE_LENGTH),
